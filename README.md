@@ -42,4 +42,4 @@ Dual self-supervised:
 
 ## License
 
-MIT (planned, on public release)
+Apache 2.0 (planned, on public release)
