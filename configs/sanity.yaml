@@ -3,7 +3,8 @@ seed: 42
 
 data:
   data_dir: /scratch/x3397a12/resona/data
-  datasets: [autsl, lsa64]      # smallest two
+  index_cache_dir: /scratch/x3397a12/resona/cache/index
+  datasets: [lsa64, ghanaian_sl]   # smallest two (autsl excluded — H5 group corruption)
   clip_len: 64
   flat_dim: 234                  # 77 joints * 3
   batch_size: 4

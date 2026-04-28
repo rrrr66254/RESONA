@@ -104,6 +104,7 @@ class Trainer:
             split="train",
             sample_mode=sample_mode,
             augment=aug,
+            cache_dir=d.get("index_cache_dir"),
         )
         sampler = DistributedSampler(self.train_set, shuffle=True, drop_last=True) if self.dist.is_dist else None
         self.train_loader = DataLoader(

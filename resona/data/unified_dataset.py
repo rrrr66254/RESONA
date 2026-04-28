@@ -11,10 +11,18 @@ Sample modes:
   - "single": returns one augmented clip per index
   - "two_view": returns two independently-augmented temporal crops of the same
                 clip — used for BYOL-style temporal contrastive learning.
+
+Index caching:
+  Walking yt_asl alone (390K clips) takes ~35 min on Lustre. The index is
+  cached to disk after first build, keyed by (h5 paths + mtimes + split).
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import pickle
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -45,6 +53,7 @@ class UnifiedSignDataset(Dataset):
         min_frames: drop clips shorter than this.
         sample_mode: "single" or "two_view".
         augment: SkeletonAugment | None — applied per view.
+        cache_dir: directory to store/load pickled index. None disables caching.
     """
 
     def __init__(
@@ -56,6 +65,7 @@ class UnifiedSignDataset(Dataset):
         min_frames: int = 8,
         sample_mode: str = "single",
         augment: SkeletonAugment | None = None,
+        cache_dir: str | Path | None = None,
     ):
         assert sample_mode in ("single", "two_view")
         self.h5_paths = [str(p) for p in h5_paths]
@@ -65,6 +75,7 @@ class UnifiedSignDataset(Dataset):
         self.min_frames = min_frames
         self.sample_mode = sample_mode
         self.augment = augment
+        self.cache_dir = Path(cache_dir) if cache_dir else None
 
         self.index: list[ClipIndex] = []
         self._build_index()
@@ -72,17 +83,90 @@ class UnifiedSignDataset(Dataset):
 
     # ----- index ------------------------------------------------------------
 
+    def _cache_key(self) -> str:
+        """Hash of h5 path + mtime + size + split + flat_dim + min_frames.
+
+        Invalidates cache automatically when any H5 file changes.
+        """
+        parts = []
+        for p in self.h5_paths:
+            try:
+                st = os.stat(p)
+                parts.append(f"{p}:{st.st_mtime_ns}:{st.st_size}")
+            except OSError:
+                parts.append(f"{p}:MISSING")
+        parts.append(f"split={self.split}")
+        parts.append(f"flat_dim={self.flat_dim}")
+        parts.append(f"min_frames={self.min_frames}")
+        h = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+        return h
+
+    def _cache_path(self) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        return self.cache_dir / f"resona_index_{self._cache_key()}.pkl"
+
+    def _try_load_cache(self) -> bool:
+        cp = self._cache_path()
+        if cp is None or not cp.exists():
+            return False
+        try:
+            with open(cp, "rb") as f:
+                payload = pickle.load(f)
+            if payload.get("version") != 1:
+                return False
+            self.index = payload["index"]
+            print(f"[UnifiedSignDataset] loaded index from cache: "
+                  f"{len(self.index)} clips ({cp.name})")
+            return True
+        except Exception as e:
+            print(f"[UnifiedSignDataset] cache load failed: {e}")
+            return False
+
+    def _save_cache(self) -> None:
+        cp = self._cache_path()
+        if cp is None:
+            return
+        try:
+            with open(cp, "wb") as f:
+                pickle.dump({"version": 1, "index": self.index}, f, protocol=4)
+            print(f"[UnifiedSignDataset] saved index cache: {cp.name}")
+        except Exception as e:
+            print(f"[UnifiedSignDataset] cache save failed: {e}")
+
     def _build_index(self) -> None:
+        if self._try_load_cache():
+            return
+        t0 = time.time()
         for fi, p in enumerate(self.h5_paths):
             if not os.path.exists(p):
                 print(f"[warn] missing H5: {p}")
                 continue
-            with h5py.File(p, "r") as f:
-                self._scan(f, fi, "")
-        print(f"[UnifiedSignDataset] {len(self.index)} clips across {len(self.h5_paths)} H5")
+            t1 = time.time()
+            try:
+                with h5py.File(p, "r") as f:
+                    self._scan(f, fi, "")
+                print(f"  scanned {os.path.basename(p)}: total now "
+                      f"{len(self.index)} clips ({time.time()-t1:.1f}s)")
+            except Exception as e:
+                print(f"  [WARN] scan failed for {p}: {type(e).__name__}: {e}")
+        print(f"[UnifiedSignDataset] {len(self.index)} clips across "
+              f"{len(self.h5_paths)} H5 (build took {time.time()-t0:.1f}s)")
+        self._save_cache()
 
     def _scan(self, group: h5py.Group, file_idx: int, prefix: str) -> None:
-        for k, v in group.items():
+        try:
+            keys = list(group.keys())
+        except Exception:
+            return  # corrupt group — skip silently
+        for k in keys:
+            try:
+                v = group[k]
+            except Exception:
+                continue
+            if v is None:
+                continue
             path = f"{prefix}/{k}" if prefix else k
             if isinstance(v, h5py.Group):
                 if self.split is not None and k in {"train", "dev", "val", "test", "validation"}:
@@ -90,9 +174,13 @@ class UnifiedSignDataset(Dataset):
                         continue
                 self._scan(v, file_idx, path)
             elif isinstance(v, h5py.Dataset):
-                if v.ndim == 2 and v.shape[-1] == self.flat_dim and v.shape[0] >= self.min_frames:
+                try:
+                    shape = v.shape
+                except Exception:
+                    continue
+                if len(shape) == 2 and shape[-1] == self.flat_dim and shape[0] >= self.min_frames:
                     self.index.append(
-                        ClipIndex(file_idx=file_idx, h5_path_in_file=path, n_frames=v.shape[0])
+                        ClipIndex(file_idx=file_idx, h5_path_in_file=path, n_frames=shape[0])
                     )
 
     def _split_match(self, k: str) -> bool:

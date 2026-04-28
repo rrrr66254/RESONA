@@ -3,7 +3,11 @@ seed: 42
 
 data:
   data_dir: /scratch/x3397a12/resona/data
-  datasets: all                  # use every H5 found
+  index_cache_dir: /scratch/x3397a12/resona/cache/index
+  # explicit list (autsl excluded — group-level H5 corruption to be rebuilt)
+  datasets: [chicago_fswild, dgs, ghanaian_sl, greek_sl, how2sign, include,
+             karsl, ksl_sign103, ksl_sign636, lsa64, phoenix, sign2mint,
+             slovo, yt_asl]
   clip_len: 256
   flat_dim: 234
   batch_size: 16                 # per-GPU
