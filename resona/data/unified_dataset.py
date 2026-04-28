@@ -6,6 +6,11 @@ or:
     {h5_root}/{group}/{split}/{video_id} -> (T, 234) float32   (KSL103 case)
 
 Each H5 file is opened lazily per worker (avoids fork-after-open issues).
+
+Sample modes:
+  - "single": returns one augmented clip per index
+  - "two_view": returns two independently-augmented temporal crops of the same
+                clip — used for BYOL-style temporal contrastive learning.
 """
 from __future__ import annotations
 
@@ -19,11 +24,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .augment import SkeletonAugment, temporal_crop
+
 
 @dataclass
 class ClipIndex:
     file_idx: int
-    h5_path_in_file: str  # absolute path inside the H5
+    h5_path_in_file: str
     n_frames: int
 
 
@@ -36,6 +43,8 @@ class UnifiedSignDataset(Dataset):
         flat_dim: 234 for canonical RESONA-77 (77 joints × (x,y,validity)).
         split: 'train' | 'dev' | 'test' | None (None = all).
         min_frames: drop clips shorter than this.
+        sample_mode: "single" or "two_view".
+        augment: SkeletonAugment | None — applied per view.
     """
 
     def __init__(
@@ -45,17 +54,20 @@ class UnifiedSignDataset(Dataset):
         flat_dim: int = 234,
         split: str | None = "train",
         min_frames: int = 8,
+        sample_mode: str = "single",
+        augment: SkeletonAugment | None = None,
     ):
+        assert sample_mode in ("single", "two_view")
         self.h5_paths = [str(p) for p in h5_paths]
         self.clip_len = clip_len
         self.flat_dim = flat_dim
         self.split = split
         self.min_frames = min_frames
+        self.sample_mode = sample_mode
+        self.augment = augment
 
         self.index: list[ClipIndex] = []
         self._build_index()
-
-        # per-worker handles (lazy)
         self._handles: dict[int, h5py.File] = {}
 
     # ----- index ------------------------------------------------------------
@@ -73,7 +85,6 @@ class UnifiedSignDataset(Dataset):
         for k, v in group.items():
             path = f"{prefix}/{k}" if prefix else k
             if isinstance(v, h5py.Group):
-                # filter by split if last path segment looks like split name
                 if self.split is not None and k in {"train", "dev", "val", "test", "validation"}:
                     if not self._split_match(k):
                         continue
@@ -100,6 +111,26 @@ class UnifiedSignDataset(Dataset):
             self._handles[file_idx] = h
         return h
 
+    # ----- sampling helpers -------------------------------------------------
+
+    def _load_full(self, ci: ClipIndex) -> torch.Tensor:
+        """Load the entire clip as a torch tensor (T, 234)."""
+        ds = self._get(ci.file_idx)[ci.h5_path_in_file]
+        arr = ds[:]  # full read; H5 chunked, OK
+        return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
+
+    def _make_view(self, full: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Independent temporal crop (with implicit pad) + augmentation.
+        Returns (x: (clip_len, 234), valid_mask: (clip_len,) bool).
+        """
+        T = full.shape[0]
+        cropped = temporal_crop(full, self.clip_len)
+        valid = torch.zeros(self.clip_len, dtype=torch.bool)
+        valid[: min(T, self.clip_len)] = True
+        if self.augment is not None:
+            cropped = self.augment(cropped)
+        return cropped, valid
+
     # ----- API --------------------------------------------------------------
 
     def __len__(self) -> int:
@@ -107,23 +138,20 @@ class UnifiedSignDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         ci = self.index[idx]
-        ds = self._get(ci.file_idx)[ci.h5_path_in_file]
-        T = ds.shape[0]
+        full = self._load_full(ci)
 
-        # random crop / pad to clip_len
-        if T >= self.clip_len:
-            start = np.random.randint(0, T - self.clip_len + 1)
-            arr = ds[start : start + self.clip_len]
-            mask = np.ones(self.clip_len, dtype=np.bool_)
-        else:
-            arr = np.zeros((self.clip_len, self.flat_dim), dtype=np.float32)
-            arr[:T] = ds[:]
-            mask = np.zeros(self.clip_len, dtype=np.bool_)
-            mask[:T] = True
+        if self.sample_mode == "single":
+            x, m = self._make_view(full)
+            return {"x": x, "valid_mask": m, "src_file": ci.file_idx}
 
-        x = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))  # (T, 234)
-        m = torch.from_numpy(mask)  # (T,)
-        return {"x": x, "valid_mask": m, "src_file": ci.file_idx}
+        # two_view: two independent crops + augmentations
+        x1, m1 = self._make_view(full)
+        x2, m2 = self._make_view(full)
+        return {
+            "x1": x1, "valid_mask1": m1,
+            "x2": x2, "valid_mask2": m2,
+            "src_file": ci.file_idx,
+        }
 
 
 def discover_h5(data_dir: str | Path, datasets: Sequence[str] | str = "all") -> list[str]:
