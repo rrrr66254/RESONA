@@ -10,8 +10,8 @@ data:
              phoenix, sign2mint, slovo, yt_asl]
   clip_len: 256
   flat_dim: 234
-  batch_size: 24                 # was 8; 3× scaled for GPU saturation
-  num_workers: 12                # was 2; sltrain 80 cores available
+  batch_size: 32                 # was 24; 4× total scale, ~14 GB mem (18 GB margin)
+  num_workers: 12                # sltrain 80 cores available
   augment:
     spatial_jitter: 0.02
     horizontal_flip_prob: 0.5
@@ -45,10 +45,10 @@ objective:
     loss_weight: 0.5
 
 train:
-  total_steps: 500000             # 200K → 500K: ~16 epochs (12M sample views), ~3.4 days @ 0.58 s/step
-  lr: 1.2e-3                      # was 4e-4; linear scaling for batch 8→24 (3×)
+  total_steps: 700000             # 30 epochs (1 epoch = 741K/32 ≈ 23.2K steps), ~4 days @ 0.5 s/step
+  lr: 1.4e-3                      # sqrt scaling from batch 24→32 (1.2e-3 × √(32/24))
   weight_decay: 0.05
-  warmup_steps: 4000              # was 2000; longer warmup for higher peak lr
+  warmup_steps: 4000
   grad_clip: 1.0
   amp: bf16
   ckpt_interval: 5000
