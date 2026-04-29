@@ -1,63 +1,63 @@
 """Skeleton augmentation for RESONA-77 (T, 234) tensors.
 
 Schema layout per frame (234 floats):
-    [0   : 154]   77 joints × (x, y)         = 154
-    [154 : 231]   77 joints × confidence     = 77
-    [231 : 234]   3 part validity flags      = 3
+    [0   : 231]   77 joints × (x, y, conf) interleaved   (T, 77, 3)
+    [231 : 234]   3 part validity flags                   (T, 3)
 
-NOTE: Joint layout is NOT (joint, [x, y, conf]) interleaved. (x, y) for all 77
-joints come first, then 77 confidences, then 3 part flags. We split per-segment
-when applying spatial transforms; only (x, y) block is mutated.
+Only the joint block (T, 77, 3) is interpreted as per-joint, with last channel
+being confidence. Augmentation:
+- spatial_jitter: noise on (x, y) only, conf untouched
+- horizontal_flip: flip x sign (no L/R swap), conf untouched
+- temporal_speed: interpolate joints linearly, tail nearest
 """
 from __future__ import annotations
 
 import torch
 
 N_JOINTS = 77
-XY_END = N_JOINTS * 2          # 154
-CONF_END = XY_END + N_JOINTS   # 231
-TAIL_END = CONF_END + 3        # 234 (= part validity flags)
+JOINT_BLOCK = N_JOINTS * 3   # 231
+TAIL = 3
+TOTAL = JOINT_BLOCK + TAIL   # 234
 
 
 # ---------- low-level: split / merge ----------------------------------------
 
 def _split(x: torch.Tensor):
-    """(T, 234) -> (xy_view: T,77,2, conf: T,77, tail: T,3)."""
+    """(T, 234) -> (j: T,77,3, tail: T,3)."""
     T, D = x.shape
-    if D != TAIL_END:
-        raise ValueError(f"expected D={TAIL_END}, got {D}")
-    xy = x[:, :XY_END].view(T, N_JOINTS, 2)
-    conf = x[:, XY_END:CONF_END]
-    tail = x[:, CONF_END:TAIL_END]
-    return xy, conf, tail
+    if D != TOTAL:
+        raise ValueError(f"expected D={TOTAL}, got {D}")
+    j = x[:, :JOINT_BLOCK].view(T, N_JOINTS, 3)
+    tail = x[:, JOINT_BLOCK:]
+    return j, tail
 
 
-def _merge(xy: torch.Tensor, conf: torch.Tensor, tail: torch.Tensor) -> torch.Tensor:
-    """(T,77,2)+(T,77)+(T,3) -> (T, 234)."""
-    T = xy.shape[0]
-    flat_xy = xy.reshape(T, XY_END)
-    return torch.cat([flat_xy, conf, tail], dim=-1)
+def _merge(j: torch.Tensor, tail: torch.Tensor) -> torch.Tensor:
+    """(T,77,3) + (T,3) -> (T, 234)."""
+    T, J, _ = j.shape
+    return torch.cat([j.reshape(T, J * 3), tail], dim=-1)
 
 
-# ---------- per-op transforms (operate on xy only) --------------------------
+# ---------- per-op transforms (operate on (x,y) inside joint block) --------
 
 def spatial_jitter(x: torch.Tensor, sigma: float = 0.02) -> torch.Tensor:
-    """Gaussian noise on (x, y) only."""
+    """Gaussian noise on (x, y); confidence and tail untouched."""
     if sigma <= 0:
         return x
-    xy, conf, tail = _split(x)
-    xy = xy + torch.randn_like(xy) * sigma
-    return _merge(xy, conf, tail)
+    j, tail = _split(x)
+    j = j.clone()
+    j[..., :2] = j[..., :2] + torch.randn_like(j[..., :2]) * sigma
+    return _merge(j, tail)
 
 
 def horizontal_flip(x: torch.Tensor, prob: float = 0.5) -> torch.Tensor:
     """Mirror x-coordinate. Does NOT swap L/R joint indices (mild aug)."""
     if prob <= 0 or torch.rand(()) > prob:
         return x
-    xy, conf, tail = _split(x)
-    xy = xy.clone()
-    xy[..., 0] = -xy[..., 0]
-    return _merge(xy, conf, tail)
+    j, tail = _split(x)
+    j = j.clone()
+    j[..., 0] = -j[..., 0]
+    return _merge(j, tail)
 
 
 def temporal_crop(x: torch.Tensor, crop_len: int) -> torch.Tensor:
@@ -73,7 +73,7 @@ def temporal_crop(x: torch.Tensor, crop_len: int) -> torch.Tensor:
 
 
 def temporal_speed(x: torch.Tensor, ratio_range: tuple[float, float] = (0.8, 1.25)) -> torch.Tensor:
-    """Linearly resample along time. xy and conf interpolated; tail nearest."""
+    """Linearly resample along time. (xy, conf) interp linear; tail nearest."""
     lo, hi = ratio_range
     if lo == hi == 1.0:
         return x
@@ -83,21 +83,17 @@ def temporal_speed(x: torch.Tensor, ratio_range: tuple[float, float] = (0.8, 1.2
     if new_T == T:
         return x
 
-    xy, conf, tail = _split(x)
-    # xy: (T, 77, 2) -> (1, 154, T) for 1D interpolate
-    xy_t = xy.reshape(T, XY_END).permute(1, 0).unsqueeze(0)  # (1, 154, T)
-    xy_new = torch.nn.functional.interpolate(xy_t, size=new_T, mode="linear", align_corners=False)
-    xy_new = xy_new.squeeze(0).permute(1, 0).reshape(new_T, N_JOINTS, 2)
-
-    conf_t = conf.permute(1, 0).unsqueeze(0)                 # (1, 77, T)
-    conf_new = torch.nn.functional.interpolate(conf_t, size=new_T, mode="linear", align_corners=False)
-    conf_new = conf_new.squeeze(0).permute(1, 0)             # (new_T, 77)
+    j, tail = _split(x)
+    # j: (T, 77, 3) -> (1, 77*3=231, T) for 1D interpolate
+    j_t = j.reshape(T, JOINT_BLOCK).permute(1, 0).unsqueeze(0)
+    j_new = torch.nn.functional.interpolate(j_t, size=new_T, mode="linear", align_corners=False)
+    j_new = j_new.squeeze(0).permute(1, 0).reshape(new_T, N_JOINTS, 3)
 
     tail_t = tail.permute(1, 0).unsqueeze(0)                 # (1, 3, T)
     tail_new = torch.nn.functional.interpolate(tail_t, size=new_T, mode="nearest")
     tail_new = tail_new.squeeze(0).permute(1, 0)             # (new_T, 3)
 
-    return _merge(xy_new, conf_new, tail_new)
+    return _merge(j_new, tail_new)
 
 
 # ---------- compositional augmentor -----------------------------------------
@@ -105,9 +101,9 @@ def temporal_speed(x: torch.Tensor, ratio_range: tuple[float, float] = (0.8, 1.2
 class SkeletonAugment:
     """Default RESONA augmentation pipeline.
 
-    Operates on (T, 234) tensors, mutating only the (x, y) block. Confidence
-    and part-validity tail are interpolated only by speed perturbation
-    (linear/nearest), preserved otherwise.
+    Operates on (T, 234) tensors. Joint (x, y) is mutated by jitter/flip;
+    confidence is preserved; tail validity is preserved (only resampled by
+    speed perturb via nearest-neighbor).
     """
 
     def __init__(
