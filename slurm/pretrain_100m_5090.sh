@@ -18,6 +18,7 @@ conda activate hmc_vlm                     # reuse existing env (sltrain disk ti
 export CUDA_VISIBLE_DEVICES=${GPU_ID}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONNOUSERSITE=1
+export PYTHONPATH="$RESONA_ROOT:$PYTHONPATH"
 
 mkdir -p "$CKPT_ROOT/100m"
 
