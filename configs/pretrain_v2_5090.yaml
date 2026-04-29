@@ -10,8 +10,8 @@ data:
              phoenix, sign2mint, slovo, yt_asl]
   clip_len: 256
   flat_dim: 234
-  batch_size: 8
-  num_workers: 2
+  batch_size: 24                 # was 8; 3× scaled for GPU saturation
+  num_workers: 12                # was 2; sltrain 80 cores available
   augment:
     spatial_jitter: 0.02
     horizontal_flip_prob: 0.5
@@ -46,9 +46,9 @@ objective:
 
 train:
   total_steps: 200000
-  lr: 4.0e-4
+  lr: 1.2e-3                      # was 4e-4; linear scaling for batch 8→24 (3×)
   weight_decay: 0.05
-  warmup_steps: 2000
+  warmup_steps: 4000              # was 2000; longer warmup for higher peak lr
   grad_clip: 1.0
   amp: bf16
   ckpt_interval: 5000
