@@ -243,10 +243,17 @@ class UnifiedSignDataset(Dataset):
 
 
 def discover_h5(data_dir: str | Path, datasets: Sequence[str] | str = "all") -> list[str]:
-    """Find skeleton_resona77_*.h5 in `data_dir`. `datasets` filters by name suffix."""
+    """Find skeleton_resona77_*.h5 in `data_dir`.
+
+    `datasets`:
+      - "all": include every `skeleton_resona77_*.h5` in dir
+      - list of dataset names: include only files with stem == `skeleton_resona77_{name}`
+        (exact match — protects against accidental matches like `autsl_corrupt`)
+    """
     data_dir = Path(data_dir)
     files = sorted(data_dir.glob("skeleton_resona77_*.h5"))
     if datasets == "all":
         return [str(p) for p in files]
     keep = set(datasets)
-    return [str(p) for p in files if any(k in p.stem for k in keep)]
+    expected = {f"skeleton_resona77_{k}" for k in keep}
+    return [str(p) for p in files if p.stem in expected]
