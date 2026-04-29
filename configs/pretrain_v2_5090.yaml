@@ -1,0 +1,56 @@
+# RESONA v2 pretrain config — sub-pose ST-GCN + RoPE Transformer + multi-objective.
+# Target: 5090 single GPU, ~110M encoder, bf16, 200K steps (~5-7 days).
+seed: 42
+
+data:
+  data_dir: /mnt/synology_nas_00/junkim/AutoResearch/data/cache
+  index_cache_dir: /mnt/synology_nas_00/junkim/AutoResearch/data/.cache/index_resona
+  datasets: [autsl, chicago_fswild, dgs, ghanaian_sl, greek_sl, how2sign,
+             include, karsl, ksl_sign103, ksl_sign636, lsa64, openasl,
+             phoenix, sign2mint, slovo, yt_asl]
+  clip_len: 256
+  flat_dim: 234
+  batch_size: 8
+  num_workers: 2
+  augment:
+    spatial_jitter: 0.02
+    horizontal_flip_prob: 0.5
+    speed_range: [0.85, 1.15]
+
+model:
+  # Sub-pose ST-GCN encoder (4 groups: body9 / lhand21 / rhand21 / mface26)
+  subpose_ch: 256                # per-group out channels
+  # Modern Transformer
+  d_model: 768
+  n_heads: 12                    # head_dim 64
+  n_layers: 18
+  ffn_dim: 2048                  # SwiGLU
+  dropout: 0.1
+  max_len: 512
+  use_flash_attn: false          # SDPA fallback
+
+objective:
+  msm:
+    enabled: true
+    mask_ratio: 0.60
+    loss_weight: 1.0
+  forward_pred:
+    enabled: true
+    k: 16
+    loss_weight: 0.3
+  contrastive:
+    enabled: false               # MSM + ForwardPred only first; BYOL ablation later
+    proj_dim: 256
+    ema_decay: 0.996
+    loss_weight: 0.5
+
+train:
+  total_steps: 200000
+  lr: 4.0e-4
+  weight_decay: 0.05
+  warmup_steps: 2000
+  grad_clip: 1.0
+  amp: bf16
+  ckpt_interval: 5000
+  eval_interval: 10000
+  log_interval: 50

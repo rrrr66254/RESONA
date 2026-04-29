@@ -1,7 +1,12 @@
-"""DDP-aware RESONA pretrain trainer.
+"""DDP-aware RESONA pretrain trainer (v2: multi-objective).
 
 Single-GPU and multi-GPU paths share this Trainer. DDP is initialized lazily
 from environment (`torchrun` or Slurm `srun` populates LOCAL_RANK / RANK / WORLD_SIZE).
+
+v2 changes vs v1:
+  - Encoder: sub-pose ST-GCN + RoPE Transformer (resona.models.transformer)
+  - Multi-objective: MSM + ForwardPred + (optional) BYOL contrastive
+  - Heads consolidated under resona.models.heads
 """
 from __future__ import annotations
 
@@ -15,14 +20,15 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 from .data.augment import SkeletonAugment
 from .data.unified_dataset import UnifiedSignDataset, discover_h5
-from .models.contrastive_head import TemporalContrastive
-from .models.msm_head import MSMHead, apply_mask, make_joint_mask, msm_loss
+from .models.heads import (
+    ForwardPredHead, MSMHead, TemporalContrastive,
+    apply_mask, forward_pred_loss, make_joint_mask, msm_loss,
+)
 from .models.transformer import TransformerEncoder
 
 
@@ -94,7 +100,7 @@ class Trainer:
         aug = SkeletonAugment(
             spatial_sigma=aug_cfg.get("spatial_jitter", 0.02),
             flip_prob=aug_cfg.get("horizontal_flip_prob", 0.5),
-            speed_range=aug_cfg.get("speed_range", (0.85, 1.15)),
+            speed_range=tuple(aug_cfg.get("speed_range", (0.85, 1.15))),
         )
         sample_mode = "two_view" if self.cfg["objective"]["contrastive"]["enabled"] else "single"
         self.train_set = UnifiedSignDataset(
@@ -130,33 +136,42 @@ class Trainer:
             ffn_dim=m["ffn_dim"],
             dropout=m.get("dropout", 0.1),
             max_len=m["max_len"],
+            subpose_ch=m.get("subpose_ch", 256),
         ).to(self.dist.device)
+
         self.msm_head = MSMHead(d_model=m["d_model"]).to(self.dist.device)
 
         o = self.cfg["objective"]
         self.use_msm = o["msm"]["enabled"]
+        self.use_fwd = o.get("forward_pred", {}).get("enabled", False)
         self.use_con = o["contrastive"]["enabled"]
-        self.contrastive: TemporalContrastive | None = None
+
+        self.fwd_head = None
+        if self.use_fwd:
+            self.fwd_head = ForwardPredHead(d_model=m["d_model"]).to(self.dist.device)
+
+        self.contrastive = None
         if self.use_con:
             self.contrastive = TemporalContrastive(
-                encoder=self.encoder,
-                d_model=m["d_model"],
+                encoder=self.encoder, d_model=m["d_model"],
                 proj_dim=o["contrastive"]["proj_dim"],
                 ema_decay=o["contrastive"]["ema_decay"],
             ).to(self.dist.device)
 
         if self.dist.is_dist:
-            self.encoder = DDP(self.encoder, device_ids=[self.dist.local_rank],
-                               find_unused_parameters=False)
+            self.encoder = DDP(self.encoder, device_ids=[self.dist.local_rank], find_unused_parameters=False)
             self.msm_head = DDP(self.msm_head, device_ids=[self.dist.local_rank])
+            if self.fwd_head is not None:
+                self.fwd_head = DDP(self.fwd_head, device_ids=[self.dist.local_rank])
             if self.contrastive is not None:
-                # online wrapped via encoder (already DDP'd); only proj_online + predict need DDP
                 self.contrastive.proj_online = DDP(self.contrastive.proj_online, device_ids=[self.dist.local_rank])
                 self.contrastive.predict = DDP(self.contrastive.predict, device_ids=[self.dist.local_rank])
 
         if self.dist.is_main:
             n = sum(p.numel() for p in self._encoder_inner().parameters())
-            print(f"[Trainer] encoder params: {n/1e6:.1f}M")
+            n_msm = sum(p.numel() for p in (self.msm_head.module if isinstance(self.msm_head, DDP) else self.msm_head).parameters())
+            n_fwd = sum(p.numel() for p in (self.fwd_head.module if isinstance(self.fwd_head, DDP) else self.fwd_head).parameters()) if self.fwd_head else 0
+            print(f"[Trainer] encoder: {n/1e6:.1f}M | msm: {n_msm/1e6:.2f}M | fwd: {n_fwd/1e6:.2f}M")
 
     def _encoder_inner(self) -> nn.Module:
         e = self.encoder
@@ -167,26 +182,21 @@ class Trainer:
         params: list[nn.Parameter] = []
         params += list(self._encoder_inner().parameters())
         params += list((self.msm_head.module if isinstance(self.msm_head, DDP) else self.msm_head).parameters())
+        if self.fwd_head is not None:
+            params += list((self.fwd_head.module if isinstance(self.fwd_head, DDP) else self.fwd_head).parameters())
         if self.contrastive is not None:
             for m in (self.contrastive.proj_online, self.contrastive.predict):
                 params += list((m.module if isinstance(m, DDP) else m).parameters())
         self.params = [p for p in params if p.requires_grad]
-        self.opt = torch.optim.AdamW(
-            self.params,
-            lr=t["lr"],
-            weight_decay=t.get("weight_decay", 0.05),
-            betas=(0.9, 0.95),
-        )
+        self.opt = torch.optim.AdamW(self.params, lr=t["lr"], weight_decay=t.get("weight_decay", 0.05), betas=(0.9, 0.95))
         self.amp = t.get("amp", "bf16")
         self.scaler = torch.amp.GradScaler("cuda") if self.amp == "fp16" else None
 
-    # ---- train step ----
+    # ---- step ----
 
     def _amp_dtype(self):
-        if self.amp == "bf16":
-            return torch.bfloat16
-        if self.amp == "fp16":
-            return torch.float16
+        if self.amp == "bf16": return torch.bfloat16
+        if self.amp == "fp16": return torch.float16
         return torch.float32
 
     def _step_batch(self, batch: dict) -> dict[str, float]:
@@ -199,12 +209,12 @@ class Trainer:
 
         with torch.amp.autocast("cuda", enabled=(self.amp != "fp32"), dtype=self._amp_dtype()):
             if self.use_con and self.contrastive is not None:
+                # Two-view path
                 x1 = batch["x1"].to(dev, non_blocking=True)
                 x2 = batch["x2"].to(dev, non_blocking=True)
                 m1 = batch["valid_mask1"].to(dev, non_blocking=True)
                 m2 = batch["valid_mask2"].to(dev, non_blocking=True)
 
-                # MSM uses view 1
                 if self.use_msm:
                     mask = make_joint_mask(x1, n_joints=77, mask_ratio=o["msm"]["mask_ratio"])
                     x_masked = apply_mask(x1, mask)
@@ -213,11 +223,16 @@ class Trainer:
                     l_msm = msm_loss(pred, x1, mask, m1)
                     loss = loss + o["msm"].get("loss_weight", 1.0) * l_msm
                     log["msm"] = float(l_msm.detach())
+                    if self.use_fwd and self.fwd_head is not None:
+                        l_fwd = forward_pred_loss(self.fwd_head(h), h, k=o["forward_pred"].get("k", 16), valid_mask=m1)
+                        loss = loss + o["forward_pred"].get("loss_weight", 0.3) * l_fwd
+                        log["fwd"] = float(l_fwd.detach())
 
                 l_con = self.contrastive(x1, x2, m1, m2)
                 loss = loss + o["contrastive"].get("loss_weight", 0.5) * l_con
                 log["con"] = float(l_con.detach())
             else:
+                # Single view path
                 x = batch["x"].to(dev, non_blocking=True)
                 m = batch["valid_mask"].to(dev, non_blocking=True)
                 if self.use_msm:
@@ -228,6 +243,10 @@ class Trainer:
                     l_msm = msm_loss(pred, x, mask, m)
                     loss = loss + o["msm"].get("loss_weight", 1.0) * l_msm
                     log["msm"] = float(l_msm.detach())
+                    if self.use_fwd and self.fwd_head is not None:
+                        l_fwd = forward_pred_loss(self.fwd_head(h), h, k=o["forward_pred"].get("k", 16), valid_mask=m)
+                        loss = loss + o["forward_pred"].get("loss_weight", 0.3) * l_fwd
+                        log["fwd"] = float(l_fwd.detach())
 
         self.opt.zero_grad(set_to_none=True)
         if self.scaler is not None:
@@ -244,7 +263,7 @@ class Trainer:
         if self.contrastive is not None:
             self.contrastive.update_target()
 
-        # LR schedule (per-step cosine)
+        # LR schedule
         total = t.get("total_steps", t.get("steps", 100))
         warm = t.get("warmup_steps", 0)
         new_lr = cosine_with_warmup(self.step, total, warm, t["lr"])
@@ -255,7 +274,7 @@ class Trainer:
         log["lr"] = new_lr
         return log
 
-    # ---- save ----
+    # ---- save / load ----
 
     def save_ckpt(self, name: str = "last.pt") -> None:
         if not self.dist.is_main or self.ckpt_dir is None:
@@ -265,13 +284,11 @@ class Trainer:
             "encoder": self._encoder_inner().state_dict(),
             "msm_head": (self.msm_head.module if isinstance(self.msm_head, DDP) else self.msm_head).state_dict(),
         }
+        if self.fwd_head is not None:
+            state["fwd_head"] = (self.fwd_head.module if isinstance(self.fwd_head, DDP) else self.fwd_head).state_dict()
         if self.contrastive is not None:
-            state["contrastive_proj_online"] = (
-                self.contrastive.proj_online.module if isinstance(self.contrastive.proj_online, DDP) else self.contrastive.proj_online
-            ).state_dict()
-            state["contrastive_predict"] = (
-                self.contrastive.predict.module if isinstance(self.contrastive.predict, DDP) else self.contrastive.predict
-            ).state_dict()
+            state["contrastive_proj_online"] = (self.contrastive.proj_online.module if isinstance(self.contrastive.proj_online, DDP) else self.contrastive.proj_online).state_dict()
+            state["contrastive_predict"] = (self.contrastive.predict.module if isinstance(self.contrastive.predict, DDP) else self.contrastive.predict).state_dict()
             state["contrastive_target"] = self.contrastive.target.state_dict()
             state["contrastive_proj_target"] = self.contrastive.proj_target.state_dict()
         state["opt"] = self.opt.state_dict()
@@ -284,9 +301,17 @@ class Trainer:
                 print(f"[Trainer] no resume ckpt at {path}, fresh start")
             return
         st = torch.load(path, map_location="cpu", weights_only=False)
-        self._encoder_inner().load_state_dict(st["encoder"])
+        try:
+            self._encoder_inner().load_state_dict(st["encoder"])
+        except RuntimeError as e:
+            if self.dist.is_main:
+                print(f"[Trainer] encoder state_dict mismatch (architecture change?), fresh start: {e}")
+            return
         (self.msm_head.module if isinstance(self.msm_head, DDP) else self.msm_head).load_state_dict(st["msm_head"])
-        self.opt.load_state_dict(st["opt"])
+        if self.fwd_head is not None and "fwd_head" in st:
+            (self.fwd_head.module if isinstance(self.fwd_head, DDP) else self.fwd_head).load_state_dict(st["fwd_head"])
+        if "opt" in st:
+            self.opt.load_state_dict(st["opt"])
         self.step = st["step"]
         if self.contrastive is not None and "contrastive_target" in st:
             (self.contrastive.proj_online.module if isinstance(self.contrastive.proj_online, DDP) else self.contrastive.proj_online).load_state_dict(st["contrastive_proj_online"])
