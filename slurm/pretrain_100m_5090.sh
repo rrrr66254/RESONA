@@ -6,7 +6,7 @@
 
 set -e
 GPU_ID=${1:-2}
-RESONA_ROOT=/mnt/synology_nas_00/junkim/RESONA
+RESONA_ROOT=/home/sltrain/RESONA
 RUN_TS=$(date +%s)
 LOG=/home/sltrain/log_resona_100m_${RUN_TS}.log
 
