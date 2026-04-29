@@ -210,13 +210,18 @@ class UnifiedSignDataset(Dataset):
     def _make_view(self, full: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Independent temporal crop (with implicit pad) + augmentation.
         Returns (x: (clip_len, 234), valid_mask: (clip_len,) bool).
+
+        Order: pre_crop aug (temporal_speed) → temporal_crop → post_crop aug
+        (flip, jitter). This keeps clip_len invariant for batch stacking.
         """
+        if self.augment is not None:
+            full = self.augment.pre_crop(full)     # may change T
         T = full.shape[0]
         cropped = temporal_crop(full, self.clip_len)
         valid = torch.zeros(self.clip_len, dtype=torch.bool)
         valid[: min(T, self.clip_len)] = True
         if self.augment is not None:
-            cropped = self.augment(cropped)
+            cropped = self.augment.post_crop(cropped)
         return cropped, valid
 
     # ----- API --------------------------------------------------------------

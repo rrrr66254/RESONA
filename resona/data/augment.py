@@ -104,6 +104,10 @@ class SkeletonAugment:
     Operates on (T, 234) tensors. Joint (x, y) is mutated by jitter/flip;
     confidence is preserved; tail validity is preserved (only resampled by
     speed perturb via nearest-neighbor).
+
+    NOTE: Apply pre_crop() BEFORE temporal_crop, post_crop() AFTER, since
+    temporal_speed changes T and would break dataloader batching if applied
+    on a fixed-length clip.
     """
 
     def __init__(
@@ -116,11 +120,20 @@ class SkeletonAugment:
         self.flip_prob = flip_prob
         self.speed_range = speed_range
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def pre_crop(self, x: torch.Tensor) -> torch.Tensor:
+        """Length-changing transforms (temporal_speed). Apply BEFORE crop."""
         if self.speed_range != (1.0, 1.0):
             x = temporal_speed(x, self.speed_range)
+        return x
+
+    def post_crop(self, x: torch.Tensor) -> torch.Tensor:
+        """Length-preserving transforms (flip, jitter). Apply AFTER crop."""
         if self.flip_prob > 0:
             x = horizontal_flip(x, self.flip_prob)
         if self.sigma > 0:
             x = spatial_jitter(x, self.sigma)
         return x
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """Convenience: full pipeline (callers must NOT batch-crop after this)."""
+        return self.post_crop(self.pre_crop(x))
