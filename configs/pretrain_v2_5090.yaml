@@ -45,7 +45,7 @@ objective:
     loss_weight: 0.5
 
 train:
-  total_steps: 200000
+  total_steps: 500000             # 200K → 500K: ~16 epochs (12M sample views), ~3.4 days @ 0.58 s/step
   lr: 1.2e-3                      # was 4e-4; linear scaling for batch 8→24 (3×)
   weight_decay: 0.05
   warmup_steps: 4000              # was 2000; longer warmup for higher peak lr
