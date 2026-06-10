@@ -1,1 +1,0 @@
-"""RESONA model components."""
